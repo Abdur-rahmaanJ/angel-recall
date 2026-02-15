@@ -13,7 +13,12 @@ dependencies = [
     "networkx>=3.4.2",
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
+    "flask>=3.0.0",
+    "python-dotenv>=1.0.0",
 ]
+
+[project.scripts]
+angel-recall = "angel_recall.cli:main"
 
 [tool.uv]
 package = true

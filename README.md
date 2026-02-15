@@ -17,6 +17,21 @@ Unlike standard async libraries, Angel Recall processes tasks for each session (
 pip install angel-recall
 ```
 
+### Memory Dashboard
+
+Angel Recall comes with a built-in Flask dashboard to visualize your memory vault and chat with your agent in real-time.
+
+```bash
+# Launch the dashboard
+angel-recall memos
+```
+
+The dashboard allows you to:
+- **Configure API Keys**: Add `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, etc., directly from the UI.
+- **Switch Models**: Test different LLMs (local via Ollama or remote via LiteLLM).
+- **Inspect Memories**: View all `MemCubes` in your vault, including their semantic types, access scopes, and timestamps.
+- **Chat**: Interact with the memory-augmented agent and see how memories are created and retrieved.
+
 ### Basic Usage
 
 ```python
