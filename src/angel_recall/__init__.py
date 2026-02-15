@@ -291,8 +291,20 @@ class MemReader:
 
     def parse(self, prompt: str, user: str = "default_user") -> Dict[str, Any]:
         try:
+            system_msg = (
+                "You are a Memory Operations Parser. Analyze the user prompt and extract the intended memory action.\n"
+                "Available operations: store, retrieve, update, delete, query, summarize.\n"
+                "Semantic types: fact, preference, task, dialogue, procedure, rule.\n\n"
+                "Guidelines:\n"
+                "1. If the user indicates a CHANGE of state (e.g., 'I moved to', 'I now live in', 'Actually I prefer'), "
+                "set operation to 'update' and identify the subject in task_intent.\n"
+                "2. If the user corrects themselves (e.g., 'No, I meant', 'Actually'), set task_intent to 'correction'.\n"
+                "3. Extract the core information into 'content_summary'.\n"
+                "3. If storing a fact about the user, set semantic_type to 'fact'.\n"
+                "4. If asking a question, set operation to 'retrieve'."
+            )
             messages = [
-                {"role": "system", "content": "Extract memory operation as JSON."},
+                {"role": "system", "content": system_msg},
                 {"role": "user", "content": prompt}
             ]
             response = litellm.completion(
@@ -459,9 +471,11 @@ class MemOperator:
 
     def hybrid_retrieve(self, query: str, user: str, namespace: Optional[str] = None,
                         n_results: int = 5) -> List[MemCube]:
-        semantic_results = self.api.query(query, user, namespace, n_results)
-        semantic_results.sort(key=lambda c: (c.priority, c.timestamp), reverse=True)
-        return semantic_results[:n_results]
+        semantic_results = self.api.query(query, user, namespace, n_results * 2)
+        # Filter out archived memories
+        active_results = [c for c in semantic_results if c.state != MemoryState.ARCHIVED]
+        active_results.sort(key=lambda c: (c.priority, c.timestamp), reverse=True)
+        return active_results[:n_results]
 
 # ---------------------------
 # MemScheduler
@@ -490,12 +504,17 @@ class MemScheduler:
 
     def _get_plaintext_candidates(self, query: str, user: str, limit: int = 5) -> List[MemCube]:
         candidates = []
+        stop_words = {"where", "does", "the", "live", "is", "my", "are"}
+        query_words = [w.lower() for w in query.split() if w.lower() not in stop_words]
+        
         for cube in self.vault.kv_store.values():
-            if cube.memory_type == MemoryType.PLAINTEXT:
-                if isinstance(cube.payload, str) and any(word in cube.payload.lower() for word in query.split()):
-                    # Include user's own memories OR shared/public ones
-                    if cube.owner == user or cube.access_scope in [AccessScope.SHARED, AccessScope.PUBLIC]:
-                        candidates.append(cube)
+            if cube.memory_type == MemoryType.PLAINTEXT and cube.state != MemoryState.ARCHIVED:
+                if isinstance(cube.payload, str):
+                    payload_lower = cube.payload.lower()
+                    if any(word in payload_lower for word in query_words):
+                        # Include user's own memories OR shared/public ones
+                        if cube.owner == user or cube.access_scope in [AccessScope.SHARED, AccessScope.PUBLIC]:
+                            candidates.append(cube)
         return candidates[:limit]
 
 # ---------------------------
@@ -554,21 +573,38 @@ class MemOS:
 
         scheduled_cubes = self.scheduler.schedule(parsed, {})
         
-        if parsed["operation"] == "store":
-            cube = create_plaintext(text=parsed["content_summary"], semantic_type=SemanticType(parsed["semantic_type"]), owner=user)
+        if parsed["operation"] in ("store", "update"):
+            content = parsed["content_summary"]
+            # Proactive conflict resolution for Facts or explicit Updates
+            if parsed["semantic_type"] == "fact" or parsed["operation"] == "update":
+                # Extract potential keywords to find old versions
+                # Use task_intent if provided by LLM, otherwise keywords from content
+                search_q = parsed.get("task_intent") or " ".join([w for w in content.lower().split() if len(w) > 3 and w not in ["user", "lives", "lived"]])
+                
+                if search_q:
+                    existing = self.operator.hybrid_retrieve(query=search_q, user=user, n_results=5)
+                    for old_cube in existing:
+                        if old_cube.semantic_type == SemanticType.FACT:
+                            self.lifecycle.transition(old_cube.id, MemoryState.ARCHIVED)
+
+            cube = create_plaintext(text=content, semantic_type=SemanticType(parsed["semantic_type"]), owner=user)
             cid = self.api.create(cube, namespace=f"user_{user}")
             if cid:
                 res["cubes"].append(cid)
-                res["response"] = f"Stored: {parsed['content_summary']}"
+                res["response"] = f"{'Updated' if parsed['operation'] == 'update' else 'Stored'}: {content}"
 
         elif parsed["operation"] in ("retrieve", "query"):
             # We don't restrict to user namespace for retrieval to allow finding shared memories
             cubes = self.operator.hybrid_retrieve(query=parsed["content_summary"], user=user, namespace=None, n_results=3)
             all_cubes = cubes + [c for c in scheduled_cubes if c.id not in [rc.id for rc in cubes]]
+            
+            # GLOBAL SORT: Ensure newest is always first for the LLM
+            all_cubes.sort(key=lambda c: c.timestamp, reverse=True)
+            
             res["cubes"] = [c.id for c in all_cubes]
             if all_cubes:
-                snippets = [f"• {self.api._format_payload(c.payload, 100)}" for c in all_cubes[:5]]
-                res["response"] = "Memory Context:\n" + "\n".join(snippets)
+                snippets = [f"• [{c.timestamp.strftime('%Y-%m-%d %H:%M')}] {self.api._format_payload(c.payload, 100)}" for c in all_cubes[:5]]
+                res["response"] = "Memory Context (Newest First):\n" + "\n".join(snippets)
             else:
                 res["response"] = "No relevant memories found in vault."
 
@@ -605,7 +641,15 @@ def create_memory_agent(memos: MemOS, model: Optional[str] = None, tools: Option
         return {"memory_response": result.get("response", "")}
 
     def llm_node(state: AgentState):
-        msgs = [{"role": "system", "content": f"Memory: {state.get('memory_response', '')}"}]
+        system_prompt = (
+            "You are a Memory-Augmented Assistant. "
+            "Use the provided Memory Context to answer the user. "
+            "IMPORTANT: Memories are provided in reverse chronological order (newest first). "
+            "If you find conflicting information (e.g., two different locations for where the user lives), "
+            "ALWAYS prioritize the newest information and treat it as the current truth. "
+            "Do NOT mention the old/conflicting information unless specifically asked about history."
+        )
+        msgs = [{"role": "system", "content": f"{system_prompt}\n\nMemory Context: {state.get('memory_response', '')}"}]
         for m in state['messages']:
             role = "user" if isinstance(m, HumanMessage) else "assistant"
             msgs.append({"role": role, "content": m.content})

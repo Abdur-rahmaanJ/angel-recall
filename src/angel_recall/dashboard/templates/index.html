@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Angel Recall Dashboard</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body { background-color: #f8f9fa; height: 100vh; display: flex; flex-direction: column; }
+        .main-container { flex: 1; display: flex; overflow: hidden; }
+        .chat-section { flex: 1; display: flex; flex-direction: column; border-right: 1px solid #dee2e6; background: white; }
+        .memory-section { width: 400px; display: flex; flex-direction: column; background: #fff; }
+        #chat-messages { flex: 1; overflow-y: auto; padding: 1rem; }
+        #memory-list { flex: 1; overflow-y: auto; padding: 1rem; font-size: 0.85rem; }
+        .message { margin-bottom: 1rem; padding: 0.5rem 1rem; border-radius: 1rem; max-width: 80%; }
+        .user-message { background-color: #007bff; color: white; align-self: flex-end; margin-left: auto; }
+        .bot-message { background-color: #e9ecef; color: black; align-self: flex-start; }
+        .memory-card { border: 1px solid #eee; margin-bottom: 0.5rem; padding: 0.5rem; border-radius: 0.25rem; }
+        .memory-tag { font-size: 0.7rem; padding: 0.1rem 0.3rem; border-radius: 0.2rem; margin-right: 0.2rem; }
+        .tag-fact { background: #d1ecf1; color: #0c5460; }
+        .tag-pref { background: #d4edda; color: #155724; }
+        .tag-private { border: 1px solid #f5c6cb; color: #721c24; }
+        .tag-shared { border: 1px solid #bee5eb; color: #0c5460; }
+        .config-panel { padding: 1rem; border-bottom: 1px solid #dee2e6; background: #eee; }
+        .loading-pulse { animation: pulse 1.5s infinite; opacity: 0.6; }
+        @keyframes pulse {
+            0% { opacity: 0.4; }
+            50% { opacity: 0.8; }
+            100% { opacity: 0.4; }
+        }
+    </style>
+</head>
+<body>
+
+<nav class="navbar navbar-dark bg-dark">
+    <div class="container-fluid">
+        <span class="navbar-brand mb-0 h1">😇 Angel Recall Dashboard</span>
+        <div>
+            <button class="btn btn-outline-danger btn-sm" onclick="clearMemories()">Clear Vault</button>
+        </div>
+    </div>
+</nav>
+
+<div class="config-panel">
+    <div class="row g-2">
+        <div class="col-md-4">
+            <input type="text" id="api-key" class="form-control form-control-sm" placeholder="OPENAI_API_KEY / ANTHROPIC_API_KEY">
+        </div>
+        <div class="col-md-3">
+            <select id="key-type" class="form-select form-select-sm">
+                <option value="OLLAMA">Ollama (No Key Needed)</option>
+                <option value="GEMINI_API_KEY">Gemini API Key</option>
+                <option value="GOOGLE_API_KEY">Google API Key</option>
+                <option value="OPENAI_API_KEY">OpenAI API Key</option>
+                <option value="ANTHROPIC_API_KEY">Anthropic API Key</option>
+                <option value="LITELLM_API_KEY">LiteLLM API Key</option>
+                <option value="GROQ_API_KEY">Groq API Key</option>
+            </select>
+        </div>
+        <div class="col-md-3">
+            <input type="text" id="model-name" class="form-control form-control-sm" placeholder="Model (e.g. gpt-4o, ollama/qwen2.5:0.5b)" value="ollama/qwen2.5:0.5b" list="model-suggestions">
+            <datalist id="model-suggestions">
+                <option value="ollama/qwen2.5:0.5b">
+                <option value="ollama/llama3:8b">
+                <option value="ollama/mistral">
+                <option value="ollama/phi3">
+                <option value="gemini/gemini-1.5-flash">
+                <option value="gpt-4o">
+                <option value="claude-3-5-sonnet-20240620">
+            </datalist>
+        </div>
+        <div class="col-md-2">
+            <button class="btn btn-primary btn-sm w-100" onclick="saveConfig()">Save Config</button>
+        </div>
+    </div>
+</div>
+
+<div class="main-container">
+    <div class="chat-section">
+        <div id="chat-messages" class="d-flex flex-column">
+            <div class="message bot-message">Hello! I'm your Memory-Augmented Assistant. How can I help you today?</div>
+        </div>
+        <div class="p-3 border-top">
+            <div class="input-group">
+                <input type="text" id="user-input" class="form-control" placeholder="Type a message or tell me something to remember..." onkeypress="if(event.key==='Enter') sendMessage()">
+                <button class="btn btn-primary" onclick="sendMessage()">Send</button>
+            </div>
+            <div class="mt-2">
+                <small class="text-muted">User: <input type="text" id="user-name" value="alice" style="border:none; border-bottom:1px solid #ccc; outline:none; width: 60px;"></small>
+            </div>
+        </div>
+    </div>
+
+    <div class="memory-section">
+        <div class="p-2 bg-light border-bottom d-flex justify-content-between align-items-center">
+            <strong>Memory Vault</strong>
+            <button class="btn btn-sm btn-link" onclick="refreshMemories()">Refresh</button>
+        </div>
+        <div id="memory-list">
+            <!-- Memories will be populated here -->
+        </div>
+    </div>
+</div>
+
+<script>
+    async function saveConfig() {
+        const keyType = document.getElementById('key-type').value;
+        const apiKey = document.getElementById('api-key').value;
+        const model = document.getElementById('model-name').value;
+        
+        const api_keys = {};
+        if (apiKey && keyType !== 'OLLAMA') api_keys[keyType] = apiKey;
+
+        const resp = await fetch('/api/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ api_keys, model })
+        });
+        const data = await resp.json();
+        alert('Config saved! Model: ' + data.model);
+    }
+
+    async function sendMessage() {
+        const input = document.getElementById('user-input');
+        const sendBtn = document.querySelector('button[onclick="sendMessage()"]');
+        const text = input.value.trim();
+        const user = document.getElementById('user-name').value.trim();
+        if (!text) return;
+
+        appendMessage('user', text);
+        input.value = '';
+        
+        // Disable input and show loading
+        input.disabled = true;
+        sendBtn.disabled = true;
+        const loadingMsg = appendMessage('bot', '...', null, true);
+
+        try {
+            const resp = await fetch('/api/chat', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ message: text, user: user })
+            });
+            const data = await resp.json();
+            
+            // Remove loading message
+            loadingMsg.remove();
+
+            if (data.error) {
+                appendMessage('bot', 'Error: ' + data.error);
+            } else {
+                appendMessage('bot', data.response, data.model);
+            }
+        } catch (e) {
+            loadingMsg.remove();
+            appendMessage('bot', 'Connection Error: ' + e.message);
+        } finally {
+            input.disabled = false;
+            sendBtn.disabled = false;
+            input.focus();
+            refreshMemories();
+        }
+    }
+
+    function appendMessage(role, text, model = null, isLoading = false) {
+        const container = document.getElementById('chat-messages');
+        const div = document.createElement('div');
+        div.className = `message ${role === 'user' ? 'user-message' : 'bot-message'}`;
+        if (isLoading) div.classList.add('loading-pulse');
+        
+        let content = text;
+        if (model) {
+            content = `<small class="d-block text-muted mb-1" style="font-size: 0.6rem;">Model: ${model}</small>` + text;
+            div.innerHTML = content;
+        } else {
+            div.innerText = text;
+        }
+        
+        container.appendChild(div);
+        container.scrollTop = container.scrollHeight;
+        return div;
+    }
+
+    async function refreshMemories() {
+        const resp = await fetch('/api/memories');
+        const memories = await resp.json();
+        const list = document.getElementById('memory-list');
+        list.innerHTML = '';
+
+        memories.forEach(m => {
+            const card = document.createElement('div');
+            card.className = 'memory-card';
+            
+            const tags = `
+                <span class="memory-tag tag-${m.semantic_type === 'fact' ? 'fact' : 'pref'}">${m.semantic_type}</span>
+                <span class="memory-tag tag-${m.access_scope}">${m.access_scope}</span>
+                <span class="text-muted" style="font-size: 0.65rem">${new Date(m.timestamp).toLocaleString()}</span>
+            `;
+            
+            card.innerHTML = `
+                <div class="mb-1">${tags}</div>
+                <div style="word-break: break-all;">${typeof m.payload === 'string' ? m.payload : JSON.stringify(m.payload)}</div>
+                <div class="text-muted mt-1" style="font-size: 0.65rem">ID: ${m.id.substring(0,8)}... | Owner: ${m.owner}</div>
+            `;
+            list.appendChild(card);
+        });
+    }
+
+    async function clearMemories() {
+        if (!confirm('Are you sure you want to clear all memories?')) return;
+        await fetch('/api/memories/clear', { method: 'POST' });
+        refreshMemories();
+    }
+
+    // Initial load
+    refreshMemories();
+    setInterval(refreshMemories, 5000);
+</script>
+
+</body>
+</html>
