@@ -159,6 +159,9 @@ def create_parameter(adapter_ref: str, **kwargs) -> MemCube:
 class MemVault:
     def __init__(self, persist_directory: str = "./memvault"):
         self.persist_directory = persist_directory
+        if not os.path.exists(persist_directory):
+            os.makedirs(persist_directory)
+        
         self.chroma_client = chromadb.PersistentClient(path=persist_directory)
         self.plaintext_collection = self.chroma_client.get_or_create_collection(
             name="plaintext_memory", metadata={"hnsw:space": "cosine"}
@@ -166,13 +169,61 @@ class MemVault:
         self.graph = nx.MultiDiGraph()
         self.kv_store: Dict[str, MemCube] = {}
         self.namespaces: Dict[str, Set[str]] = defaultdict(set)
+        
+        self._load_from_disk()
+
+    def _get_kv_path(self):
+        return os.path.join(self.persist_directory, "kv_store.json")
+
+    def _get_graph_path(self):
+        return os.path.join(self.persist_directory, "graph.json")
+
+    def _save_to_disk(self):
+        try:
+            # Save KV Store
+            kv_data = {cid: cube.to_dict() for cid, cube in self.kv_store.items()}
+            with open(self._get_kv_path(), 'w') as f:
+                json.dump(kv_data, f, indent=2)
+            
+            # Save Graph
+            graph_data = nx.node_link_data(self.graph)
+            with open(self._get_graph_path(), 'w') as f:
+                json.dump(graph_data, f, indent=2)
+        except Exception as e:
+            print(f"MemVault._save_to_disk failed: {e}")
+
+    def _load_from_disk(self):
+        try:
+            # Load KV Store
+            kv_path = self._get_kv_path()
+            if os.path.exists(kv_path):
+                with open(kv_path, 'r') as f:
+                    kv_data = json.load(f)
+                    for cid, data in kv_data.items():
+                        cube = MemCube.from_dict(data)
+                        self.kv_store[cid] = cube
+                        # Rebuild namespaces
+                        ns = data.get('namespace', 'default')
+                        # Note: namespace isn't in MemCube but was passed to store()
+                        # For now we'll put them in default or extract from metadata if we had it
+                        # Let's assume most are user namespaces
+                        self.namespaces[ns].add(cid)
+
+            # Load Graph
+            graph_path = self._get_graph_path()
+            if os.path.exists(graph_path):
+                with open(graph_path, 'r') as f:
+                    graph_data = json.load(f)
+                    self.graph = nx.node_link_graph(graph_data)
+        except Exception as e:
+            print(f"MemVault._load_from_disk failed: {e}")
 
     def store(self, cube: MemCube, namespace: str = "default") -> Optional[str]:
         try:
             cube_id = cube.id
             self.kv_store[cube_id] = cube
             self.namespaces[namespace].add(cube_id)
-            self.graph.add_node(cube_id, cube=cube.to_dict())
+            self.graph.add_node(cube_id, cube=cube.to_dict(), namespace=namespace)
 
             if cube.memory_type == MemoryType.PLAINTEXT and isinstance(cube.payload, str):
                 self.plaintext_collection.add(
@@ -186,9 +237,10 @@ class MemVault:
                     }],
                     ids=[cube_id]
                 )
+            self._save_to_disk()
             return cube_id
         except Exception as e:
-            print(f"❌ MemVault.store failed: {e}")
+            print(f"MemVault.store failed: {e}")
             return None
 
     def get(self, cube_id: str) -> Optional[MemCube]:
@@ -203,6 +255,7 @@ class MemVault:
             del self.kv_store[cube_id]
             for ns in self.namespaces:
                 self.namespaces[ns].discard(cube_id)
+            self._save_to_disk()
 
     def semantic_search(self, query: str, n_results: int = 5,
                         namespace: Optional[str] = None,
@@ -340,12 +393,18 @@ class MemReader:
 
         store_triggers = ["remember", "save", "store", "add", "note that", "keep in mind", "don't forget"]
         pref_triggers = ["i like", "i prefer", "my favorite", "i love", "my preference"]
+        identity_triggers = ["i live in", "i am in", "i moved to", "i now live in", "my name is", "i am a", "i work at", "i am from"]
         delete_triggers = ["forget", "delete", "remove", "clear"]
         query_triggers = ["what", "how", "who", "where", "when", "why", "do you know", "tell me about"]
 
         if any(k in lower for k in delete_triggers):
             parsed["operation"] = "delete"
             parsed["task_intent"] = "memory deletion"
+        elif any(k in lower for k in identity_triggers):
+            parsed["operation"] = "store"
+            parsed["task_intent"] = "identity/location storage"
+            parsed["content_summary"] = prompt
+            parsed["semantic_type"] = "fact"
         elif any(lower.startswith(k) for k in query_triggers) or lower.endswith("?"):
             parsed["operation"] = "retrieve"
             parsed["task_intent"] = "memory retrieval"
