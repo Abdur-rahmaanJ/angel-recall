@@ -31,6 +31,7 @@ from pydantic import BaseModel, Field
 
 
 litellm.set_verbose = False
+litellm.suppress_debug_info = True
 
 __all__ = [
     "MemOS",
@@ -159,6 +160,9 @@ def create_parameter(adapter_ref: str, **kwargs) -> MemCube:
 class MemVault:
     def __init__(self, persist_directory: str = "./memvault"):
         self.persist_directory = persist_directory
+        if not os.path.exists(persist_directory):
+            os.makedirs(persist_directory)
+        
         self.chroma_client = chromadb.PersistentClient(path=persist_directory)
         self.plaintext_collection = self.chroma_client.get_or_create_collection(
             name="plaintext_memory", metadata={"hnsw:space": "cosine"}
@@ -166,13 +170,61 @@ class MemVault:
         self.graph = nx.MultiDiGraph()
         self.kv_store: Dict[str, MemCube] = {}
         self.namespaces: Dict[str, Set[str]] = defaultdict(set)
+        
+        self._load_from_disk()
+
+    def _get_kv_path(self):
+        return os.path.join(self.persist_directory, "kv_store.json")
+
+    def _get_graph_path(self):
+        return os.path.join(self.persist_directory, "graph.json")
+
+    def _save_to_disk(self):
+        try:
+            # Save KV Store
+            kv_data = {cid: cube.to_dict() for cid, cube in self.kv_store.items()}
+            with open(self._get_kv_path(), 'w') as f:
+                json.dump(kv_data, f, indent=2)
+            
+            # Save Graph
+            graph_data = nx.node_link_data(self.graph)
+            with open(self._get_graph_path(), 'w') as f:
+                json.dump(graph_data, f, indent=2)
+        except Exception as e:
+            print(f"MemVault._save_to_disk failed: {e}")
+
+    def _load_from_disk(self):
+        try:
+            # Load KV Store
+            kv_path = self._get_kv_path()
+            if os.path.exists(kv_path):
+                with open(kv_path, 'r') as f:
+                    kv_data = json.load(f)
+                    for cid, data in kv_data.items():
+                        cube = MemCube.from_dict(data)
+                        self.kv_store[cid] = cube
+                        # Rebuild namespaces
+                        ns = data.get('namespace', 'default')
+                        # Note: namespace isn't in MemCube but was passed to store()
+                        # For now we'll put them in default or extract from metadata if we had it
+                        # Let's assume most are user namespaces
+                        self.namespaces[ns].add(cid)
+
+            # Load Graph
+            graph_path = self._get_graph_path()
+            if os.path.exists(graph_path):
+                with open(graph_path, 'r') as f:
+                    graph_data = json.load(f)
+                    self.graph = nx.node_link_graph(graph_data)
+        except Exception as e:
+            print(f"MemVault._load_from_disk failed: {e}")
 
     def store(self, cube: MemCube, namespace: str = "default") -> Optional[str]:
         try:
             cube_id = cube.id
             self.kv_store[cube_id] = cube
             self.namespaces[namespace].add(cube_id)
-            self.graph.add_node(cube_id, cube=cube.to_dict())
+            self.graph.add_node(cube_id, cube=cube.to_dict(), namespace=namespace)
 
             if cube.memory_type == MemoryType.PLAINTEXT and isinstance(cube.payload, str):
                 self.plaintext_collection.add(
@@ -186,9 +238,10 @@ class MemVault:
                     }],
                     ids=[cube_id]
                 )
+            self._save_to_disk()
             return cube_id
         except Exception as e:
-            print(f"❌ MemVault.store failed: {e}")
+            print(f"MemVault.store failed: {e}")
             return None
 
     def get(self, cube_id: str) -> Optional[MemCube]:
@@ -203,6 +256,7 @@ class MemVault:
             del self.kv_store[cube_id]
             for ns in self.namespaces:
                 self.namespaces[ns].discard(cube_id)
+            self._save_to_disk()
 
     def semantic_search(self, query: str, n_results: int = 5,
                         namespace: Optional[str] = None,
@@ -338,14 +392,29 @@ class MemReader:
             "timestamp": datetime.now().isoformat()
         }
 
+        # Handle very short conversational fillers by doing NOTHING
+        if lower in ["yes", "no", "ok", "okay", "thanks", "thank you", "yep", "nope"]:
+            parsed["operation"] = "none"
+            return parsed
+
         store_triggers = ["remember", "save", "store", "add", "note that", "keep in mind", "don't forget"]
         pref_triggers = ["i like", "i prefer", "my favorite", "i love", "my preference"]
+        identity_triggers = ["i live in", "i am in", "i moved to", "i now live in", "my name is", "i am a", "i work at", "i am from"]
         delete_triggers = ["forget", "delete", "remove", "clear"]
-        query_triggers = ["what", "how", "who", "where", "when", "why", "do you know", "tell me about"]
+        query_triggers = ["what", "how", "who", "where", "when", "why", "do you know", "tell me about", "list"]
 
         if any(k in lower for k in delete_triggers):
             parsed["operation"] = "delete"
             parsed["task_intent"] = "memory deletion"
+        elif lower.startswith("list "):
+            parsed["operation"] = "summarize"
+            parsed["task_intent"] = "list all memories"
+            parsed["content_summary"] = lower[5:].strip()
+            if "preference" in lower:
+                parsed["semantic_type"] = "preference"
+            elif "fact" in lower:
+                parsed["semantic_type"] = "fact"
+        elif any(k in lower for k in identity_triggers):
         elif any(lower.startswith(k) for k in query_triggers) or lower.endswith("?"):
             parsed["operation"] = "retrieve"
             parsed["task_intent"] = "memory retrieval"
@@ -608,6 +677,26 @@ class MemOS:
             else:
                 res["response"] = "No relevant memories found in vault."
 
+        elif parsed["operation"] == "summarize":
+            # List all memories of a certain type or all memories
+            semantic_filter = SemanticType.FACT
+            if parsed["semantic_type"] == "preference":
+                semantic_filter = SemanticType.PREFERENCE
+            
+            all_cubes = [c for c in self.vault.kv_store.values() if c.owner == user and c.state != MemoryState.ARCHIVED]
+            if "preference" in parsed["content_summary"]:
+                all_cubes = [c for c in all_cubes if c.semantic_type == SemanticType.PREFERENCE]
+            elif "fact" in parsed["content_summary"]:
+                all_cubes = [c for c in all_cubes if c.semantic_type == SemanticType.FACT]
+            
+            all_cubes.sort(key=lambda c: c.timestamp, reverse=True)
+            res["cubes"] = [c.id for c in all_cubes]
+            if all_cubes:
+                snippets = [f"• {self.api._format_payload(c.payload, 150)}" for c in all_cubes]
+                res["response"] = f"Here are your {parsed['semantic_type']}s (Newest First):\n" + "\n".join(snippets)
+            else:
+                res["response"] = f"I couldn't find any {parsed['semantic_type']}s in my memory."
+
         elif parsed["operation"] == "delete":
             cubes = self.operator.hybrid_retrieve(parsed["content_summary"], user, n_results=1)
             if cubes:
@@ -615,6 +704,9 @@ class MemOS:
                 res["response"] = f"Deleted memory {cubes[0].id[:8]}"
             else:
                 res["response"] = "Nothing found to delete."
+        
+        elif parsed["operation"] == "none":
+            res["response"] = "Conversational acknowledgment."
         
         if not res["response"]:
             res["response"] = "Operation completed with no direct response."
