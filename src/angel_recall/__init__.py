@@ -31,6 +31,7 @@ from pydantic import BaseModel, Field
 
 
 litellm.set_verbose = False
+litellm.suppress_debug_info = True
 
 __all__ = [
     "MemOS",
@@ -391,20 +392,29 @@ class MemReader:
             "timestamp": datetime.now().isoformat()
         }
 
+        # Handle very short conversational fillers by doing NOTHING
+        if lower in ["yes", "no", "ok", "okay", "thanks", "thank you", "yep", "nope"]:
+            parsed["operation"] = "none"
+            return parsed
+
         store_triggers = ["remember", "save", "store", "add", "note that", "keep in mind", "don't forget"]
         pref_triggers = ["i like", "i prefer", "my favorite", "i love", "my preference"]
         identity_triggers = ["i live in", "i am in", "i moved to", "i now live in", "my name is", "i am a", "i work at", "i am from"]
         delete_triggers = ["forget", "delete", "remove", "clear"]
-        query_triggers = ["what", "how", "who", "where", "when", "why", "do you know", "tell me about"]
+        query_triggers = ["what", "how", "who", "where", "when", "why", "do you know", "tell me about", "list"]
 
         if any(k in lower for k in delete_triggers):
             parsed["operation"] = "delete"
             parsed["task_intent"] = "memory deletion"
+        elif lower.startswith("list "):
+            parsed["operation"] = "summarize"
+            parsed["task_intent"] = "list all memories"
+            parsed["content_summary"] = lower[5:].strip()
+            if "preference" in lower:
+                parsed["semantic_type"] = "preference"
+            elif "fact" in lower:
+                parsed["semantic_type"] = "fact"
         elif any(k in lower for k in identity_triggers):
-            parsed["operation"] = "store"
-            parsed["task_intent"] = "identity/location storage"
-            parsed["content_summary"] = prompt
-            parsed["semantic_type"] = "fact"
         elif any(lower.startswith(k) for k in query_triggers) or lower.endswith("?"):
             parsed["operation"] = "retrieve"
             parsed["task_intent"] = "memory retrieval"
@@ -667,6 +677,26 @@ class MemOS:
             else:
                 res["response"] = "No relevant memories found in vault."
 
+        elif parsed["operation"] == "summarize":
+            # List all memories of a certain type or all memories
+            semantic_filter = SemanticType.FACT
+            if parsed["semantic_type"] == "preference":
+                semantic_filter = SemanticType.PREFERENCE
+            
+            all_cubes = [c for c in self.vault.kv_store.values() if c.owner == user and c.state != MemoryState.ARCHIVED]
+            if "preference" in parsed["content_summary"]:
+                all_cubes = [c for c in all_cubes if c.semantic_type == SemanticType.PREFERENCE]
+            elif "fact" in parsed["content_summary"]:
+                all_cubes = [c for c in all_cubes if c.semantic_type == SemanticType.FACT]
+            
+            all_cubes.sort(key=lambda c: c.timestamp, reverse=True)
+            res["cubes"] = [c.id for c in all_cubes]
+            if all_cubes:
+                snippets = [f"• {self.api._format_payload(c.payload, 150)}" for c in all_cubes]
+                res["response"] = f"Here are your {parsed['semantic_type']}s (Newest First):\n" + "\n".join(snippets)
+            else:
+                res["response"] = f"I couldn't find any {parsed['semantic_type']}s in my memory."
+
         elif parsed["operation"] == "delete":
             cubes = self.operator.hybrid_retrieve(parsed["content_summary"], user, n_results=1)
             if cubes:
@@ -674,6 +704,9 @@ class MemOS:
                 res["response"] = f"Deleted memory {cubes[0].id[:8]}"
             else:
                 res["response"] = "Nothing found to delete."
+        
+        elif parsed["operation"] == "none":
+            res["response"] = "Conversational acknowledgment."
         
         if not res["response"]:
             res["response"] = "Operation completed with no direct response."
