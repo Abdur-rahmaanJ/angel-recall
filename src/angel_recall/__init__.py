@@ -10,6 +10,7 @@ Angel Recall: Agentic memory based on MemOS.
 import json
 import uuid
 import threading
+import os
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta
 from enum import Enum
@@ -415,6 +416,9 @@ class MemReader:
             elif "fact" in lower:
                 parsed["semantic_type"] = "fact"
         elif any(k in lower for k in identity_triggers):
+            parsed["operation"] = "store"
+            parsed["task_intent"] = "identity update"
+            parsed["content_summary"] = prompt
         elif any(lower.startswith(k) for k in query_triggers) or lower.endswith("?"):
             parsed["operation"] = "retrieve"
             parsed["task_intent"] = "memory retrieval"
@@ -712,7 +716,66 @@ class MemOS:
             res["response"] = "Operation completed with no direct response."
 
         self.governance.enforce_ttl(self.vault)
+        
+        # Periodic Distillation (Triggered if we have new dialogue)
+        if parsed["operation"] == "none" or (parsed["operation"] == "retrieve" and not res["cubes"]):
+             # If it's just a conversational turn or a query that found nothing, 
+             # let's save the raw dialogue first
+             cube = create_plaintext(text=f"User: {prompt}", semantic_type=SemanticType.DIALOGUE, owner=user)
+             self.api.create(cube, namespace=f"user_{user}_logs")
+             
+             # Then check if we should distill
+             self._distill_conversations(user)
+
         return res
+
+    def _distill_conversations(self, user: str):
+        """
+        Periodically reviews raw DIALOGUE logs and distills them into FACTs or PREFERENCEs.
+        """
+        # Count recent dialogue
+        logs = [c for c in self.vault.kv_store.values() 
+                if c.owner == user and c.semantic_type == SemanticType.DIALOGUE and c.state == MemoryState.GENERATED]
+        
+        if len(logs) >= 5: # Threshold for distillation
+            try:
+                text_to_distill = "\n".join([str(c.payload) for c in logs])
+                system_msg = (
+                    "You are a Memory Distiller. Analyze the following conversation logs and extract "
+                    "any new facts or preferences about the user that are NOT already mentioned. "
+                    "Output a list of concise statements to remember. If nothing new, output an empty list."
+                )
+                
+                # Check existing memories for context to avoid duplicates
+                existing = [c.payload for c in self.vault.kv_store.values() 
+                           if c.owner == user and c.semantic_type in [SemanticType.FACT, SemanticType.PREFERENCE]]
+                context = "\nExisting memories:\n" + "\n".join([str(e) for e in existing[:10]])
+
+                response = litellm.completion(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": system_msg + context},
+                        {"role": "user", "content": text_to_distill}
+                    ]
+                )
+                
+                # Mark logs as merged first to avoid infinite loops if processing takes time
+                for log in logs:
+                    self.lifecycle.transition(log.id, MemoryState.MERGED)
+
+                distilled_text = response.choices[0].message.content
+                if distilled_text and len(distilled_text.strip()) > 5:
+                    for line in distilled_text.split("\n"):
+                        line = line.strip("- ").strip()
+                        if line and len(line) > 10:
+                            # Parse semantic type for the new memo
+                            is_pref = any(k in line.lower() for k in ["prefer", "like", "love", "favorite", "hate"])
+                            sem_type = SemanticType.PREFERENCE if is_pref else SemanticType.FACT
+                            
+                            new_cube = create_plaintext(text=line, semantic_type=sem_type, owner=user)
+                            self.api.create(new_cube, namespace=f"user_{user}")
+            except Exception as e:
+                print(f"Distillation failed: {e}")
 
 # ---------------------------
 # LangGraph Integration
