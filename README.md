@@ -59,10 +59,43 @@ memos = MemOS(
 )
 ```
 
+## Local Embedding Optimization
+
+By default, `angel-recall` relies on external calls for embeddings via `litellm`. For better performance, privacy, and zero-latency retrieval, you can enable local embeddings using `sentence-transformers`.
+
+### Enabling Local Embeddings
+
+You can enable local embeddings during initialization or dynamically:
+
+```python
+# During initialization
+memos = MemOS(local_embedding=True)
+
+# Or dynamically
+memos.enable_local_embedding(True)
+```
+
+### Installation
+
+To use this feature, you must manually install the `sentence-transformers` library:
+
+```bash
+pip install sentence-transformers
+```
+
+If `local_embedding` is set to `True` but the library is not found, `angel-recall` will print an error message and exit.
+
 ## Memory Policies
 
 Angel Recall implements several policies to ensure your agent's memory stays relevant and secure:
 
+- **Weight Decay & Forgetting**: To simulate how humans prioritize information, memories have a `weight` (default 1.0). In every processing cycle, weights decay by a configurable rate.
+    - **Reinforcement**: Accessing or "touching" a memory increases its weight.
+    - **Forgetting**: If a memory's weight falls below a threshold (e.g., 0.3), it is automatically moved to `MemoryState.ARCHIVED`.
+    - **Configuration**:
+      ```python
+      memos = MemOS(decay_rate=0.01, min_weight=0.5)
+      ```
 - **Lifecycle Management**: Memories automatically transition through states (`GENERATED` -> `ACTIVATED` -> `ARCHIVED`). Cold memories are eventually moved to long-term storage to keep the retrieval context clean.
 - **TTL (Time-to-Live)**: You can set an expiration for any memory. Once the TTL is reached, the memory is automatically purged during the next process cycle.
 - **Access Governance**: Supports `PRIVATE`, `SHARED`, and `PUBLIC` scopes. The system verifies ownership and permissions before any read or write operation.

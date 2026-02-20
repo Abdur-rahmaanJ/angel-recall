@@ -117,10 +117,13 @@ class MemCube:
     embedding: Optional[List[float]] = None
     kv_cache: Optional[Dict[str, Any]] = None
     tags: List[str] = field(default_factory=list)
+    weight: float = 1.0
 
     def touch(self):
         self.access_count += 1
         self.last_access = datetime.now()
+        # Reinforce weight on access
+        self.weight = min(1.0, self.weight + 0.1)
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -321,9 +324,11 @@ class MemVault:
 # MemGovernance
 # ---------------------------
 class MemGovernance:
-    def __init__(self):
+    def __init__(self, decay_rate: float = 0.05, min_weight: float = 0.3):
         self.audit_log = []
         self.user_roles = {}
+        self.decay_rate = decay_rate # Reduction factor per cycle
+        self.min_weight = min_weight # Weight threshold for archiving
 
     def check_access(self, cube: MemCube, user: str, operation: str = "read") -> bool:
         if cube.owner == user:
@@ -336,6 +341,23 @@ class MemGovernance:
             return True
         return False
 
+    def decay_memories(self, vault: MemVault):
+        """Gradually reduces weight of all memories and archives cold ones."""
+        to_archive = []
+        for cid, cube in vault.kv_store.items():
+            if cube.state == MemoryState.GENERATED or cube.state == MemoryState.ACTIVATED:
+                # Apply decay
+                cube.weight = max(0.0, cube.weight - self.decay_rate)
+                
+                # Check for "forgetting" threshold
+                if cube.weight < self.min_weight:
+                    to_archive.append(cid)
+                    
+        for cid in to_archive:
+            cube = vault.kv_store[cid]
+            cube.state = MemoryState.ARCHIVED
+            self.audit("WEIGHT_DECAY_ARCHIVE", {"cube_id": cid, "final_weight": cube.weight})
+
     def enforce_ttl(self, vault: MemVault):
         now = datetime.now()
         to_delete = []
@@ -345,9 +367,13 @@ class MemGovernance:
                 if now > expiry:
                     cube.state = MemoryState.EXPIRED
                     to_delete.append(cid)
+        
         for cid in to_delete:
             vault.delete(cid)
             self.audit("TTL_EXPIRE", {"cube_id": cid})
+            
+        # Also run weight decay during this cycle
+        self.decay_memories(vault)
 
     def audit(self, action: str, details: dict):
         self.audit_log.append({
@@ -643,12 +669,13 @@ class SessionLane:
 # MemOS
 # ---------------------------
 class MemOS:
-    def __init__(self, persist_directory: str = "./memvault", model: str = "ollama/gemma3n:e4b", local_embedding: bool = False):
+    def __init__(self, persist_directory: str = "./memvault", model: str = "ollama/gemma3n:e4b", 
+                 local_embedding: bool = False, decay_rate: float = 0.05, min_weight: float = 0.3):
         self.local_embedding = local_embedding
         self.persist_directory = persist_directory
         self.model = model
         self.vault = MemVault(persist_directory, local_embedding=local_embedding)
-        self.governance = MemGovernance()
+        self.governance = MemGovernance(decay_rate=decay_rate, min_weight=min_weight)
         self.api = MemoryAPI(self.vault, self.governance)
         self.reader = MemReader(model=model)
         self.operator = MemOperator(self.vault, self.api)
