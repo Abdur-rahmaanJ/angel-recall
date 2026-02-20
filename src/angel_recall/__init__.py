@@ -77,6 +77,8 @@ class SemanticType(Enum):
     DIALOGUE = "dialogue"
     PROCEDURE = "procedure"
     RULE = "rule"
+    CORRECTION = "correction"
+    INSIGHT = "insight"
 
 # ---------------------------
 # Pydantic model for JSON output
@@ -84,7 +86,7 @@ class SemanticType(Enum):
 class MemoryOperation(BaseModel):
     operation: str = Field(description="retrieve, store, update, delete, query, summarize")
     memory_type: Optional[str] = Field(None)
-    semantic_type: str = Field(description="fact, preference, task, dialogue, procedure, rule")
+    semantic_type: str = Field(description="fact, preference, task, dialogue, procedure, rule, correction, insight")
     time_scope: Optional[str] = None
     entities: List[str] = Field(default_factory=list)
     context_window: Optional[int] = None
@@ -394,14 +396,15 @@ class MemReader:
             system_msg = (
                 "You are a Memory Operations Parser. Analyze the user prompt and extract the intended memory action.\n"
                 "Available operations: store, retrieve, update, delete, query, summarize.\n"
-                "Semantic types: fact, preference, task, dialogue, procedure, rule.\n\n"
+                "Semantic types: fact, preference, task, dialogue, procedure, rule, correction, insight.\n\n"
                 "Guidelines:\n"
                 "1. If the user indicates a CHANGE of state (e.g., 'I moved to', 'I now live in', 'Actually I prefer'), "
                 "set operation to 'update' and identify the subject in task_intent.\n"
-                "2. If the user corrects themselves (e.g., 'No, I meant', 'Actually'), set task_intent to 'correction'.\n"
-                "3. Extract the core information into 'content_summary'.\n"
-                "3. If storing a fact about the user, set semantic_type to 'fact'.\n"
-                "4. If asking a question, set operation to 'retrieve'."
+                "2. If the user corrects themselves (e.g., 'No, I meant', 'Actually', 'I was wrong'), set semantic_type to 'correction'.\n"
+                "3. If the user or agent identifies a complex pattern or deep understanding, set semantic_type to 'insight'.\n"
+                "4. Extract the core information into 'content_summary'.\n"
+                "5. If storing a fact about the user, set semantic_type to 'fact'.\n"
+                "6. If asking a question, set operation to 'retrieve'."
             )
             messages = [
                 {"role": "system", "content": system_msg},
@@ -446,6 +449,8 @@ class MemReader:
         store_triggers = ["remember", "save", "store", "add", "note that", "keep in mind", "don't forget"]
         pref_triggers = ["i like", "i prefer", "my favorite", "i love", "my preference"]
         identity_triggers = ["i live in", "i am in", "i moved to", "i now live in", "my name is", "i am a", "i work at", "i am from"]
+        correction_triggers = ["no, i meant", "actually", "no, actually", "i was wrong", "correction:"]
+        insight_triggers = ["i realized", "i discovered", "pattern:", "insight:"]
         delete_triggers = ["forget", "delete", "remove", "clear"]
         query_triggers = ["what", "how", "who", "where", "when", "why", "do you know", "tell me about", "list"]
 
@@ -479,6 +484,16 @@ class MemReader:
                     content = content[len(filler):].strip()
                     lower = content.lower()
             parsed["content_summary"] = content
+        elif any(k in lower for k in correction_triggers):
+            parsed["operation"] = "store"
+            parsed["semantic_type"] = "correction"
+            parsed["task_intent"] = "self-correction"
+            parsed["content_summary"] = prompt
+        elif any(k in lower for k in insight_triggers):
+            parsed["operation"] = "store"
+            parsed["semantic_type"] = "insight"
+            parsed["task_intent"] = "new insight"
+            parsed["content_summary"] = prompt
         elif any(k in lower for k in store_triggers + pref_triggers):
             parsed["operation"] = "store"
             parsed["task_intent"] = "memory storage"
@@ -707,23 +722,30 @@ class MemOS:
         
         if parsed["operation"] in ("store", "update"):
             content = parsed["content_summary"]
-            # Proactive conflict resolution for Facts or explicit Updates
-            if parsed["semantic_type"] == "fact" or parsed["operation"] == "update":
+            # Proactive conflict resolution for Facts, Updates, or Corrections
+            if parsed["semantic_type"] in ["fact", "correction"] or parsed["operation"] == "update":
                 # Extract potential keywords to find old versions
-                # Use task_intent if provided by LLM, otherwise keywords from content
-                search_q = parsed.get("task_intent") or " ".join([w for w in content.lower().split() if len(w) > 3 and w not in ["user", "lives", "lived"]])
+                search_q = parsed.get("task_intent") or " ".join([w for w in content.lower().split() if len(w) > 3])
                 
                 if search_q:
                     existing = self.operator.hybrid_retrieve(query=search_q, user=user, n_results=5)
                     for old_cube in existing:
-                        if old_cube.semantic_type == SemanticType.FACT:
+                        # Archive old facts if we have a new fact or correction about the same thing
+                        if old_cube.semantic_type in [SemanticType.FACT, SemanticType.CORRECTION]:
                             self.lifecycle.transition(old_cube.id, MemoryState.ARCHIVED)
 
             cube = create_plaintext(text=content, semantic_type=SemanticType(parsed["semantic_type"]), owner=user)
+            
+            # Boost priority for corrections
+            if cube.semantic_type == SemanticType.CORRECTION:
+                cube.priority = 5
+            elif cube.semantic_type == SemanticType.INSIGHT:
+                cube.priority = 3
+
             cid = self.api.create(cube, namespace=f"user_{user}")
             if cid:
                 res["cubes"].append(cid)
-                res["response"] = f"{'Updated' if parsed['operation'] == 'update' else 'Stored'}: {content}"
+                res["response"] = f"{parsed['semantic_type'].capitalize()} recorded: {content}"
 
         elif parsed["operation"] in ("retrieve", "query"):
             # We don't restrict to user namespace for retrieval to allow finding shared memories
@@ -731,34 +753,35 @@ class MemOS:
             all_cubes = cubes + [c for c in scheduled_cubes if c.id not in [rc.id for rc in cubes]]
             
             # GLOBAL SORT: Ensure newest is always first for the LLM
-            all_cubes.sort(key=lambda c: c.timestamp, reverse=True)
+            # Also consider priority in sorting if multiple are relevant
+            all_cubes.sort(key=lambda c: (c.priority, c.timestamp), reverse=True)
             
             res["cubes"] = [c.id for c in all_cubes]
             if all_cubes:
-                snippets = [f"• [{c.timestamp.strftime('%Y-%m-%d %H:%M')}] {self.api._format_payload(c.payload, 100)}" for c in all_cubes[:5]]
-                res["response"] = "Memory Context (Newest First):\n" + "\n".join(snippets)
+                snippets = [f"• [{c.timestamp.strftime('%Y-%m-%d %H:%M')}] [{c.semantic_type.value.upper()}] {self.api._format_payload(c.payload, 100)}" for c in all_cubes[:5]]
+                res["response"] = "Memory Context (Prioritized & Newest First):\n" + "\n".join(snippets)
             else:
                 res["response"] = "No relevant memories found in vault."
 
         elif parsed["operation"] == "summarize":
-            # List all memories of a certain type or all memories
-            semantic_filter = SemanticType.FACT
-            if parsed["semantic_type"] == "preference":
-                semantic_filter = SemanticType.PREFERENCE
-            
+            # List memories of a certain type
             all_cubes = [c for c in self.vault.kv_store.values() if c.owner == user and c.state != MemoryState.ARCHIVED]
-            if "preference" in parsed["content_summary"]:
-                all_cubes = [c for c in all_cubes if c.semantic_type == SemanticType.PREFERENCE]
-            elif "fact" in parsed["content_summary"]:
-                all_cubes = [c for c in all_cubes if c.semantic_type == SemanticType.FACT]
             
-            all_cubes.sort(key=lambda c: c.timestamp, reverse=True)
-            res["cubes"] = [c.id for c in all_cubes]
-            if all_cubes:
-                snippets = [f"• {self.api._format_payload(c.payload, 150)}" for c in all_cubes]
-                res["response"] = f"Here are your {parsed['semantic_type']}s (Newest First):\n" + "\n".join(snippets)
+            target_type = parsed["semantic_type"]
+            if "preference" in parsed["content_summary"]: target_type = "preference"
+            elif "fact" in parsed["content_summary"]: target_type = "fact"
+            elif "correction" in parsed["content_summary"]: target_type = "correction"
+            elif "insight" in parsed["content_summary"]: target_type = "insight"
+            
+            filtered = [c for c in all_cubes if c.semantic_type.value == target_type]
+            
+            filtered.sort(key=lambda c: c.timestamp, reverse=True)
+            res["cubes"] = [c.id for c in filtered]
+            if filtered:
+                snippets = [f"• {self.api._format_payload(c.payload, 150)}" for c in filtered]
+                res["response"] = f"Here are your {target_type}s (Newest First):\n" + "\n".join(snippets)
             else:
-                res["response"] = f"I couldn't find any {parsed['semantic_type']}s in my memory."
+                res["response"] = f"I couldn't find any {target_type}s in my memory."
 
         elif parsed["operation"] == "delete":
             cubes = self.operator.hybrid_retrieve(parsed["content_summary"], user, n_results=1)

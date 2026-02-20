@@ -85,6 +85,16 @@ pip install sentence-transformers
 
 If `local_embedding` is set to `True` but the library is not found, `angel-recall` will print an error message and exit.
 
+## Intelligent Memory Categorization
+
+Angel Recall goes beyond basic storage by automatically categorizing and prioritizing your memories based on their content and intent:
+
+- **Corrections**: When a user says "Actually, it's X," the system identifies this as a `CORRECTION`. 
+    - **High Priority**: Corrections are assigned a higher priority (default 5) to ensure they override older information in retrieval.
+    - **Proactive Archiving**: Storing a correction automatically archives older conflicting facts to maintain context accuracy.
+- **Insights**: When the agent or user identifies a complex pattern or deep understanding, it is stored as an `INSIGHT` (priority 3).
+- **Facts & Preferences**: Standard user data (priority 0).
+
 ## Memory Policies
 
 Angel Recall implements several policies to ensure your agent's memory stays relevant and secure:
@@ -180,7 +190,7 @@ Ensure Ollama is running and you have pulled the model: `ollama pull qwen2.5:0.5
 ## Core Components
 
 - **MemVault**: The storage engine combining ChromaDB for semantic search and NetworkX for relationship mapping.
-- **MemReader**: An intelligent parser that understands intent, whether you're asking to save, retrieve, or delete information.
+- **MemReader**: An intelligent parser that understands intent (store, retrieve, delete) and categorizes memories into semantic types like `CORRECTION`, `INSIGHT`, `FACT`, or `PREFERENCE`.
 - **MemGovernance**: Ensures privacy and access control, managing who can read or modify specific memory cubes.
 - **MemScheduler**: Dynamically selects the best memory fragments based on the current task's context.
 
@@ -191,3 +201,9 @@ We welcome contributions that improve the efficiency of the memory scheduler or 
 ## License
 
 Apache License 2.0. See `LICENSE` for details.
+
+
+## Credits
+
+- MemOs paper
+- Memelord by Glauber Costa
