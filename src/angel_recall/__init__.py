@@ -159,14 +159,33 @@ def create_parameter(adapter_ref: str, **kwargs) -> MemCube:
 # MemVault: unified storage
 # ---------------------------
 class MemVault:
-    def __init__(self, persist_directory: str = "./memvault"):
+    def __init__(self, persist_directory: str = "./memvault", local_embedding: bool = False):
         self.persist_directory = persist_directory
+        self.local_embedding = local_embedding
         if not os.path.exists(persist_directory):
             os.makedirs(persist_directory)
         
         self.chroma_client = chromadb.PersistentClient(path=persist_directory)
+        
+        embedding_function = None
+        if self.local_embedding:
+            try:
+                from chromadb.utils import embedding_functions
+                embedding_function = embedding_functions.SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
+            except ImportError:
+                print("\nError: 'sentence-transformers' is required for local embeddings but not found.")
+                print("Please install it manually: pip install sentence-transformers\n")
+                import sys
+                sys.exit(1)
+            except Exception as e:
+                print(f"Error loading local embedding: {e}")
+                import sys
+                sys.exit(1)
+
         self.plaintext_collection = self.chroma_client.get_or_create_collection(
-            name="plaintext_memory", metadata={"hnsw:space": "cosine"}
+            name="plaintext_memory", 
+            metadata={"hnsw:space": "cosine"},
+            embedding_function=embedding_function
         )
         self.graph = nx.MultiDiGraph()
         self.kv_store: Dict[str, MemCube] = {}
@@ -624,8 +643,11 @@ class SessionLane:
 # MemOS
 # ---------------------------
 class MemOS:
-    def __init__(self, persist_directory: str = "./memvault", model: str = "ollama/gemma3n:e4b"):
-        self.vault = MemVault(persist_directory)
+    def __init__(self, persist_directory: str = "./memvault", model: str = "ollama/gemma3n:e4b", local_embedding: bool = False):
+        self.local_embedding = local_embedding
+        self.persist_directory = persist_directory
+        self.model = model
+        self.vault = MemVault(persist_directory, local_embedding=local_embedding)
         self.governance = MemGovernance()
         self.api = MemoryAPI(self.vault, self.governance)
         self.reader = MemReader(model=model)
@@ -634,6 +656,16 @@ class MemOS:
         self.lifecycle = MemLifecycle(self.vault, self.governance)
         self.default_user = "alice"
         self._lanes: Dict[str, SessionLane] = defaultdict(SessionLane)
+
+    def enable_local_embedding(self, enabled: bool = True):
+        """Toggles local embedding support. Requires restart or re-initialization of vault."""
+        self.local_embedding = enabled
+        self.vault = MemVault(self.persist_directory, local_embedding=enabled)
+        # Update components that hold a reference to the old vault
+        self.api.vault = self.vault
+        self.operator.vault = self.vault
+        self.scheduler.vault = self.vault
+        self.lifecycle.vault = self.vault
 
     def process(self, prompt: str, user: Optional[str] = None) -> Dict[str, Any]:
         user = user or self.default_user
