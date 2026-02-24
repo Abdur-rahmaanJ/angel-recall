@@ -388,8 +388,9 @@ class MemGovernance:
 # MemReader
 # ---------------------------
 class MemReader:
-    def __init__(self, model: str = "ollama/gemma3n:e4b"):
+    def __init__(self, model: str = "ollama/gemma3n:e4b", api_base: Optional[str] = None):
         self.model = model
+        self.api_base = api_base
 
     def parse(self, prompt: str, user: str = "default_user") -> Dict[str, Any]:
         try:
@@ -414,7 +415,8 @@ class MemReader:
                 model=self.model,
                 messages=messages,
                 temperature=0.0,
-                response_format=MemoryOperation
+                response_format=MemoryOperation,
+                api_base=self.api_base
             )
             content = response.choices[0].message.content
             parsed = MemoryOperation.model_validate_json(content).model_dump()
@@ -685,14 +687,16 @@ class SessionLane:
 # ---------------------------
 class MemOS:
     def __init__(self, persist_directory: str = "./memvault", model: str = "ollama/gemma3n:e4b", 
-                 local_embedding: bool = False, decay_rate: float = 0.05, min_weight: float = 0.3):
+                 local_embedding: bool = False, decay_rate: float = 0.05, min_weight: float = 0.3,
+                 api_base: Optional[str] = None):
         self.local_embedding = local_embedding
         self.persist_directory = persist_directory
         self.model = model
+        self.api_base = api_base
         self.vault = MemVault(persist_directory, local_embedding=local_embedding)
         self.governance = MemGovernance(decay_rate=decay_rate, min_weight=min_weight)
         self.api = MemoryAPI(self.vault, self.governance)
-        self.reader = MemReader(model=model)
+        self.reader = MemReader(model=model, api_base=api_base)
         self.operator = MemOperator(self.vault, self.api)
         self.scheduler = MemScheduler(self.vault)
         self.lifecycle = MemLifecycle(self.vault, self.governance)
@@ -838,7 +842,8 @@ class MemOS:
                     messages=[
                         {"role": "system", "content": system_msg + context},
                         {"role": "user", "content": text_to_distill}
-                    ]
+                    ],
+                    api_base=self.api_base
                 )
                 
                 # Mark logs as merged first to avoid infinite loops if processing takes time
