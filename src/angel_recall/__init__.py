@@ -713,12 +713,12 @@ class MemOS:
         self.scheduler.vault = self.vault
         self.lifecycle.vault = self.vault
 
-    def process(self, prompt: str, user: Optional[str] = None, response: Optional[str] = None) -> Dict[str, Any]:
+    def process(self, prompt: str, user: Optional[str] = None, response: Optional[str] = None, namespace: Optional[str] = None) -> Dict[str, Any]:
         user = user or self.default_user
         lane = self._lanes[user]
-        return lane.run(self._process_internal, prompt, user, response)
+        return lane.run(self._process_internal, prompt, user, response, namespace)
 
-    def _process_internal(self, prompt: str, user: str, response: Optional[str] = None) -> Dict[str, Any]:
+    def _process_internal(self, prompt: str, user: str, response: Optional[str] = None, namespace: Optional[str] = None) -> Dict[str, Any]:
         parsed = self.reader.parse(prompt, user)
         res = {"parsed": parsed, "cubes": [], "response": ""}
 
@@ -746,14 +746,14 @@ class MemOS:
             elif cube.semantic_type == SemanticType.INSIGHT:
                 cube.priority = 3
 
-            cid = self.api.create(cube, namespace=f"user_{user}")
+            cid = self.api.create(cube, namespace=namespace or f"user_{user}")
             if cid:
                 res["cubes"].append(cid)
                 res["response"] = f"{parsed['semantic_type'].capitalize()} recorded: {content}"
 
         elif parsed["operation"] in ("retrieve", "query"):
             # We don't restrict to user namespace for retrieval to allow finding shared memories
-            cubes = self.operator.hybrid_retrieve(query=parsed["content_summary"], user=user, namespace=None, n_results=3)
+            cubes = self.operator.hybrid_retrieve(query=parsed["content_summary"], user=user, namespace=namespace, n_results=3)
             all_cubes = cubes + [c for c in scheduled_cubes if c.id not in [rc.id for rc in cubes]]
             
             # GLOBAL SORT: Ensure newest is always first for the LLM
@@ -811,7 +811,7 @@ class MemOS:
              if response:
                  dialogue_text += f"\nAssistant: {response}"
              cube = create_plaintext(text=dialogue_text, semantic_type=SemanticType.DIALOGUE, owner=user)
-             self.api.create(cube, namespace=f"user_{user}_logs")
+             self.api.create(cube, namespace=(namespace + "_logs") if namespace else f"user_{user}_logs")
              
              # Then check if we should distill
              self._distill_conversations(user)
