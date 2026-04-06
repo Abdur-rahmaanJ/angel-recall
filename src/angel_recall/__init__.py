@@ -108,6 +108,7 @@ class MemCube:
     semantic_type: SemanticType = SemanticType.FACT
     access_scope: AccessScope = AccessScope.PRIVATE
     owner: str = "default_user"
+    namespace: str = "default"
     ttl: Optional[int] = None
     priority: int = 0
     sensitivity_tags: List[str] = field(default_factory=list)
@@ -229,7 +230,7 @@ class MemVault:
                         cube = MemCube.from_dict(data)
                         self.kv_store[cid] = cube
                         # Rebuild namespaces
-                        ns = data.get('namespace', 'default')
+                        ns = cube.namespace
                         # Note: namespace isn't in MemCube but was passed to store()
                         # For now we'll put them in default or extract from metadata if we had it
                         # Let's assume most are user namespaces
@@ -248,6 +249,7 @@ class MemVault:
         try:
             cube_id = cube.id
             self.kv_store[cube_id] = cube
+            cube.namespace = namespace
             self.namespaces[namespace].add(cube_id)
             self.graph.add_node(cube_id, cube=cube.to_dict(), namespace=namespace)
 
@@ -639,7 +641,7 @@ class MemScheduler:
 
     def _get_plaintext_candidates(self, query: str, user: str, limit: int = 5) -> List[MemCube]:
         candidates = []
-        stop_words = {"where", "does", "the", "live", "is", "my", "are"}
+        stop_words = {"where", "does", "the", "is", "my", "are"}
         query_words = [w.lower() for w in query.split() if w.lower() not in stop_words]
         
         for cube in self.vault.kv_store.values():
