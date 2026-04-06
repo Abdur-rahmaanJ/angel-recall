@@ -290,7 +290,10 @@ class MemVault:
                         owner: Optional[str] = None) -> List[MemCube]:
         where = {}
         if namespace:
-            where["namespace"] = namespace
+            if isinstance(namespace, list):
+                where["namespace"] = {"": namespace}
+            else:
+                where["namespace"] = namespace
         if owner:
             where["owner"] = owner
         try:
@@ -650,7 +653,15 @@ class MemScheduler:
                     payload_lower = cube.payload.lower()
                     if any(word in payload_lower for word in query_words):
                         # Include user's own memories OR shared/public ones
-                        if cube.owner == user or cube.access_scope in [AccessScope.SHARED, AccessScope.PUBLIC]:
+                        # Filter by namespace if provided
+                        ns_match = True
+                        if namespace:
+                            if isinstance(namespace, list):
+                                ns_match = cube.namespace in namespace
+                            else:
+                                ns_match = cube.namespace == namespace
+                        
+                        if ns_match and (cube.owner == user or cube.access_scope in [AccessScope.SHARED, AccessScope.PUBLIC]):
                             candidates.append(cube)
         return candidates[:limit]
 
