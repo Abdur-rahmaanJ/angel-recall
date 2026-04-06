@@ -713,12 +713,12 @@ class MemOS:
         self.scheduler.vault = self.vault
         self.lifecycle.vault = self.vault
 
-    def process(self, prompt: str, user: Optional[str] = None) -> Dict[str, Any]:
+    def process(self, prompt: str, user: Optional[str] = None, response: Optional[str] = None) -> Dict[str, Any]:
         user = user or self.default_user
         lane = self._lanes[user]
-        return lane.run(self._process_internal, prompt, user)
+        return lane.run(self._process_internal, prompt, user, response)
 
-    def _process_internal(self, prompt: str, user: str) -> Dict[str, Any]:
+    def _process_internal(self, prompt: str, user: str, response: Optional[str] = None) -> Dict[str, Any]:
         parsed = self.reader.parse(prompt, user)
         res = {"parsed": parsed, "cubes": [], "response": ""}
 
@@ -807,7 +807,10 @@ class MemOS:
         if parsed["operation"] == "none" or (parsed["operation"] == "retrieve" and not res["cubes"]):
              # If it's just a conversational turn or a query that found nothing, 
              # let's save the raw dialogue first
-             cube = create_plaintext(text=f"User: {prompt}", semantic_type=SemanticType.DIALOGUE, owner=user)
+             dialogue_text = f"User: {prompt}"
+             if response:
+                 dialogue_text += f"\nAssistant: {response}"
+             cube = create_plaintext(text=dialogue_text, semantic_type=SemanticType.DIALOGUE, owner=user)
              self.api.create(cube, namespace=f"user_{user}_logs")
              
              # Then check if we should distill
