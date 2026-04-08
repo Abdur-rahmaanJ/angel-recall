@@ -108,6 +108,7 @@ class MemCube:
     semantic_type: SemanticType = SemanticType.FACT
     access_scope: AccessScope = AccessScope.PRIVATE
     owner: str = "default_user"
+    namespace: str = "default"
     ttl: Optional[int] = None
     priority: int = 0
     sensitivity_tags: List[str] = field(default_factory=list)
@@ -229,7 +230,7 @@ class MemVault:
                         cube = MemCube.from_dict(data)
                         self.kv_store[cid] = cube
                         # Rebuild namespaces
-                        ns = data.get('namespace', 'default')
+                        ns = cube.namespace
                         # Note: namespace isn't in MemCube but was passed to store()
                         # For now we'll put them in default or extract from metadata if we had it
                         # Let's assume most are user namespaces
@@ -248,6 +249,7 @@ class MemVault:
         try:
             cube_id = cube.id
             self.kv_store[cube_id] = cube
+            cube.namespace = namespace
             self.namespaces[namespace].add(cube_id)
             self.graph.add_node(cube_id, cube=cube.to_dict(), namespace=namespace)
 
@@ -288,7 +290,10 @@ class MemVault:
                         owner: Optional[str] = None) -> List[MemCube]:
         where = {}
         if namespace:
-            where["namespace"] = namespace
+            if isinstance(namespace, list):
+                where["namespace"] = {"": namespace}
+            else:
+                where["namespace"] = namespace
         if owner:
             where["owner"] = owner
         try:
@@ -639,7 +644,7 @@ class MemScheduler:
 
     def _get_plaintext_candidates(self, query: str, user: str, limit: int = 5) -> List[MemCube]:
         candidates = []
-        stop_words = {"where", "does", "the", "live", "is", "my", "are"}
+        stop_words = {"where", "does", "the", "is", "my", "are"}
         query_words = [w.lower() for w in query.split() if w.lower() not in stop_words]
         
         for cube in self.vault.kv_store.values():
@@ -648,7 +653,15 @@ class MemScheduler:
                     payload_lower = cube.payload.lower()
                     if any(word in payload_lower for word in query_words):
                         # Include user's own memories OR shared/public ones
-                        if cube.owner == user or cube.access_scope in [AccessScope.SHARED, AccessScope.PUBLIC]:
+                        # Filter by namespace if provided
+                        ns_match = True
+                        if namespace:
+                            if isinstance(namespace, list):
+                                ns_match = cube.namespace in namespace
+                            else:
+                                ns_match = cube.namespace == namespace
+                        
+                        if ns_match and (cube.owner == user or cube.access_scope in [AccessScope.SHARED, AccessScope.PUBLIC]):
                             candidates.append(cube)
         return candidates[:limit]
 
@@ -713,12 +726,12 @@ class MemOS:
         self.scheduler.vault = self.vault
         self.lifecycle.vault = self.vault
 
-    def process(self, prompt: str, user: Optional[str] = None) -> Dict[str, Any]:
+    def process(self, prompt: str, user: Optional[str] = None, response: Optional[str] = None, namespace: Optional[str] = None) -> Dict[str, Any]:
         user = user or self.default_user
         lane = self._lanes[user]
-        return lane.run(self._process_internal, prompt, user)
+        return lane.run(self._process_internal, prompt, user, response, namespace)
 
-    def _process_internal(self, prompt: str, user: str) -> Dict[str, Any]:
+    def _process_internal(self, prompt: str, user: str, response: Optional[str] = None, namespace: Optional[str] = None) -> Dict[str, Any]:
         parsed = self.reader.parse(prompt, user)
         res = {"parsed": parsed, "cubes": [], "response": ""}
 
@@ -746,14 +759,14 @@ class MemOS:
             elif cube.semantic_type == SemanticType.INSIGHT:
                 cube.priority = 3
 
-            cid = self.api.create(cube, namespace=f"user_{user}")
+            cid = self.api.create(cube, namespace=namespace or f"user_{user}")
             if cid:
                 res["cubes"].append(cid)
                 res["response"] = f"{parsed['semantic_type'].capitalize()} recorded: {content}"
 
         elif parsed["operation"] in ("retrieve", "query"):
             # We don't restrict to user namespace for retrieval to allow finding shared memories
-            cubes = self.operator.hybrid_retrieve(query=parsed["content_summary"], user=user, namespace=None, n_results=3)
+            cubes = self.operator.hybrid_retrieve(query=parsed["content_summary"], user=user, namespace=namespace, n_results=3)
             all_cubes = cubes + [c for c in scheduled_cubes if c.id not in [rc.id for rc in cubes]]
             
             # GLOBAL SORT: Ensure newest is always first for the LLM
@@ -807,8 +820,11 @@ class MemOS:
         if parsed["operation"] == "none" or (parsed["operation"] == "retrieve" and not res["cubes"]):
              # If it's just a conversational turn or a query that found nothing, 
              # let's save the raw dialogue first
-             cube = create_plaintext(text=f"User: {prompt}", semantic_type=SemanticType.DIALOGUE, owner=user)
-             self.api.create(cube, namespace=f"user_{user}_logs")
+             dialogue_text = f"User: {prompt}"
+             if response:
+                 dialogue_text += f"\nAssistant: {response}"
+             cube = create_plaintext(text=dialogue_text, semantic_type=SemanticType.DIALOGUE, owner=user)
+             self.api.create(cube, namespace=(namespace + "_logs") if namespace else f"user_{user}_logs")
              
              # Then check if we should distill
              self._distill_conversations(user)
