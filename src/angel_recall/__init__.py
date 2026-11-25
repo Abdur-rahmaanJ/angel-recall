@@ -351,6 +351,7 @@ class MemVault:
 
     def link_memories(self, src_id: str, tgt_id: str, relation: str, **attrs):
         self.graph.add_edge(src_id, tgt_id, relation=relation, **attrs)
+        self._save_to_disk()
 
     def get_related(
         self, cube_id: str, relation: Optional[str] = None
@@ -620,6 +621,8 @@ class MemoryAPI:
     def __init__(self, vault: MemVault, governance: MemGovernance):
         self.vault = vault
         self.governance = governance
+        # Optional LLM selector used only when embeddings return no candidates.
+        self.llm: Optional[Callable[[str, str, Optional[str], int], List[MemCube]]] = None
 
     def _format_payload(self, payload: Any, max_len: int = 50) -> str:
         if isinstance(payload, str):
@@ -675,49 +678,10 @@ class MemoryAPI:
             query_text, n_results * 3, namespace=namespace, owner=None
         )
 
-        # Fallback to keyword matching if semantic search returns nothing or is unavailable
-        if not candidates:
-            query_lower = query_text.lower()
-            # Try exact substring match first
-            for cube in self.vault.kv_store.values():
-                if (
-                    isinstance(cube.payload, str)
-                    and query_lower in cube.payload.lower()
-                ):
-                    if self.governance.check_access(cube, user, "read"):
-                        candidates.append(cube)
-
-            # If still nothing, try word-based matching
-            if not candidates:
-                stop_words = {
-                    "what",
-                    "is",
-                    "my",
-                    "are",
-                    "the",
-                    "a",
-                    "an",
-                    "for",
-                    "do",
-                    "you",
-                    "know",
-                    "about",
-                    "tell",
-                    "me",
-                }
-                query_words = [
-                    w.strip("?!.,")
-                    for w in query_lower.split()
-                    if w not in stop_words and len(w) > 2
-                ]
-
-                for cube in self.vault.kv_store.values():
-                    if not self.governance.check_access(cube, user, "read"):
-                        continue
-                    if isinstance(cube.payload, str):
-                        payload_lower = cube.payload.lower()
-                        if any(word in payload_lower for word in query_words):
-                            candidates.append(cube)
+        # If embeddings are unavailable or empty, let the LLM choose from the
+        # candidate pool instead of falling back to substring/word matching.
+        if not candidates and self.llm is not None:
+            candidates = self.llm(query_text, user, namespace, n_results)
 
         # Governance ensures the user can only see what they are allowed to.
         # Deduplicate and limit results
@@ -743,11 +707,23 @@ class MemOperator:
         self, query: str, user: str, namespace: Optional[str] = None, n_results: int = 5
     ) -> List[MemCube]:
         semantic_results = self.api.query(query, user, namespace, n_results * 2)
-        # Filter out archived memories
+        # Filter out archived memories; keep semantic relevance order.
         active_results = [
             c for c in semantic_results if c.state != MemoryState.ARCHIVED
         ]
-        active_results.sort(key=lambda c: (c.priority, c.timestamp), reverse=True)
+
+        # One-hop graph expansion: memories linked to a hit are usually relevant
+        # even when their wording differs from the query.
+        seen = {c.id for c in active_results}
+        for cube in list(active_results):
+            for related in self.vault.get_related(cube.id):
+                if related.id in seen or related.state == MemoryState.ARCHIVED:
+                    continue
+                if not self.api.governance.check_access(related, user, "read"):
+                    continue
+                seen.add(related.id)
+                active_results.append(related)
+
         return active_results[:n_results]
 
 
@@ -787,25 +763,20 @@ class MemScheduler:
     def _get_plaintext_candidates(
         self, query: str, user: str, limit: int = 5
     ) -> List[MemCube]:
-        candidates = []
-        stop_words = {"where", "does", "the", "is", "my", "are"}
-        query_words = [w.lower() for w in query.split() if w.lower() not in stop_words]
-
-        for cube in self.vault.kv_store.values():
-            if (
-                cube.memory_type == MemoryType.PLAINTEXT
-                and cube.state != MemoryState.ARCHIVED
-            ):
-                if isinstance(cube.payload, str):
-                    payload_lower = cube.payload.lower()
-                    if any(word in payload_lower for word in query_words):
-                        # Include user's own memories OR shared/public ones
-                        if cube.owner == user or cube.access_scope in [
-                            AccessScope.SHARED,
-                            AccessScope.PUBLIC,
-                        ]:
-                            candidates.append(cube)
-        return candidates[:limit]
+        # Semantic similarity, not keyword containment; only user-owned or
+        # explicitly shared memories are eligible.
+        candidates = self.vault.semantic_search(query, n_results=limit * 3)
+        return [
+            cube
+            for cube in candidates
+            if cube.memory_type == MemoryType.PLAINTEXT
+            and cube.state != MemoryState.ARCHIVED
+            and isinstance(cube.payload, str)
+            and (
+                cube.owner == user
+                or cube.access_scope in [AccessScope.SHARED, AccessScope.PUBLIC]
+            )
+        ][:limit]
 
 
 # ---------------------------
@@ -861,6 +832,7 @@ class MemOS:
         self.vault = MemVault(persist_directory, local_embedding=local_embedding)
         self.governance = MemGovernance(decay_rate=decay_rate, min_weight=min_weight)
         self.api = MemoryAPI(self.vault, self.governance)
+        self.api.llm = self._llm_select
         self.reader = MemReader(model=model, api_base=api_base)
         self.operator = MemOperator(self.vault, self.api)
         self.scheduler = MemScheduler(self.vault)
@@ -939,6 +911,7 @@ class MemOS:
 
             cid = self.api.create(cube, namespace=namespace or f"user_{user}")
             if cid:
+                self._link_related(cid, content, user)
                 res["cubes"].append(cid)
                 res["response"] = (
                     f"{parsed['semantic_type'].capitalize()} recorded: {content}"
@@ -1045,6 +1018,89 @@ class MemOS:
             self._distill_conversations(user)
 
         return res
+
+    def _link_related(self, cube_id: str, content: str, user: str):
+        """Link a new memory to semantically close memories."""
+        try:
+            for neighbour in self.vault.semantic_search(content, n_results=4):
+                if (
+                    neighbour.id != cube_id
+                    and neighbour.owner == user
+                    and neighbour.semantic_type != SemanticType.DIALOGUE
+                ):
+                    self.vault.link_memories(cube_id, neighbour.id, "related_to")
+        except Exception:
+            pass
+
+    def _llm_select(
+        self,
+        query: str,
+        user: str,
+        namespace: Optional[str],
+        n_results: int,
+    ) -> List[MemCube]:
+        """LLM fallback when semantic search returns nothing.
+
+        Instead of matching words, ask the model which candidate memories are
+        relevant and return them in the model's order. Bounded to the 60 newest
+        readable memories so the prompt stays small.
+        """
+        pool = [
+            cube
+            for cube in self.vault.kv_store.values()
+            if cube.memory_type == MemoryType.PLAINTEXT
+            and cube.state != MemoryState.ARCHIVED
+            and isinstance(cube.payload, str)
+            and (namespace is None or cube.namespace == namespace)
+            and self.governance.check_access(cube, user, "read")
+        ]
+        if not pool:
+            return []
+
+        pool.sort(key=lambda c: c.timestamp, reverse=True)
+        pool = pool[:60]
+        listing = "\n".join(
+            f"{i}. {self.api._format_payload(cube.payload, 240)}"
+            for i, cube in enumerate(pool)
+        )
+
+        try:
+            response = litellm.completion(
+                model=self.model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You select long-term memories that answer a query. "
+                            "Use meaning, not shared words. Return ONLY a JSON array "
+                            "of the selected memory indices, most relevant first. "
+                            "Return [] when nothing is relevant."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": f"Query:\n{query}\n\nMemories:\n{listing}",
+                    },
+                ],
+                temperature=0.0,
+                api_base=self.api_base,
+                timeout=20,
+            )
+            content = response.choices[0].message.content or ""
+            start, end = content.find("["), content.rfind("]")
+            if start == -1 or end == -1:
+                return []
+            indices = json.loads(content[start : end + 1])
+        except Exception:
+            return []
+
+        selected = []
+        for index in indices:
+            if isinstance(index, int) and 0 <= index < len(pool):
+                cube = pool[index]
+                cube.touch()
+                selected.append(cube)
+        return selected[:n_results]
 
     def _distill_conversations(self, user: str):
         """
