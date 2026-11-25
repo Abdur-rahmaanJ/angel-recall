@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.1] - 2026-11-26
+
+### Fixed
+
+- Removed the substring and stop-word retrieval fallback. When embeddings return no candidates, an optional LLM selector chooses relevant memories; without one the result is empty instead of a keyword guess.
+- `MemOperator.hybrid_retrieve()` keeps semantic relevance order and expands one hop through the memory graph, re-checking access for neighbours and filtering archived memories.
+- `MemScheduler` candidates are selected by semantic similarity rather than keyword containment.
+- `MemVault.link_memories()` now persists `graph.json`, so edges survive a restart.
+
 ## [0.4.0] - 2026-02-20
 ### Added
 - **Intelligent Memory Categorization**: New `CORRECTION` and `INSIGHT` semantic types.
